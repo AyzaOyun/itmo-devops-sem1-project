@@ -13,8 +13,7 @@ import (
     "strconv"
     "strings"
     "time"
-
-    "github.com/gorilla/mux"
+    
     _ "github.com/lib/pq"
 )
 
@@ -39,7 +38,7 @@ func main() {
     for i := 0; i < 10; i++ {
         if err := db.Ping(); err != nil {
             log.Printf("Attempt %d: Database ping failed, retrying...", i+1)
-            time.Sleep(2 * time.Second)
+            time.Sleep(1 * time.Second)
         } else {
             break
         }
@@ -52,11 +51,15 @@ func main() {
 
     createTable()
 
-    r := mux.NewRouter()
-    r.HandleFunc("/api/v0/prices", handlePrices).Methods("POST", "GET")
+    http.HandleFunc("/api/v0/prices", handlePrices)
 
-    log.Println("Server starting on :8080")
-    log.Fatal(http.ListenAndServe(":8080", r))
+    port := os.Getenv("PORT")
+    if port == "" {
+        port = "8080"
+    }
+    
+    log.Println("Server starting on :" + port)
+    log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
 func createTable() {
@@ -92,7 +95,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 
     // Поддержка multipart/form-data
     if strings.Contains(r.Header.Get("Content-Type"), "multipart/form-data") {
-        err := r.ParseMultipartForm(10 << 20)
+        err := r.ParseMultipartForm(10 << 20) // 10 MB
         if err != nil {
             http.Error(w, "Failed to parse form", http.StatusBadRequest)
             return
@@ -104,11 +107,12 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
             return
         }
         defer file.Close()
+        
         processCSV(file, w)
         return
     }
     
-    // Оригинальная логика для application/zip
+    // Если не multipart, читаем напрямую
     processCSV(r.Body, w)
 }
 
@@ -130,6 +134,7 @@ func processCSV(reader io.Reader, w http.ResponseWriter) {
         return
     }
     
+    // Ищем CSV файл в архиве
     var csvFile *zip.File
     for _, f := range zipReader.File {
         baseName := filepath.Base(f.Name)
@@ -139,7 +144,7 @@ func processCSV(reader io.Reader, w http.ResponseWriter) {
         }
     }
     if csvFile == nil {
-        http.Error(w, "CSV file not found", http.StatusBadRequest)
+        http.Error(w, "CSV file not found in archive", http.StatusBadRequest)
         return
     }
 
@@ -182,33 +187,53 @@ func processCSV(reader io.Reader, w http.ResponseWriter) {
     }
     defer stmt.Close()
     
-    // Пропускаем заголовок если он есть
+    // Определяем есть ли заголовок
     start := 0
     if len(records) > 0 {
-        firstRecord := strings.ToLower(strings.Join(records[0], ","))
-        if strings.Contains(firstRecord, "id") && 
-           strings.Contains(firstRecord, "create_date") && 
-           strings.Contains(firstRecord, "name") && 
-           strings.Contains(firstRecord, "category") && 
-           strings.Contains(firstRecord, "price") {
+        // Проверяем, первая ли строка - заголовок
+        firstRecord := strings.Join(records[0], ",")
+        firstRecordLower := strings.ToLower(firstRecord)
+        if strings.Contains(firstRecordLower, "id") && 
+           (strings.Contains(firstRecordLower, "name") || strings.Contains(firstRecordLower, "date")) {
             start = 1
         }
     }
     
-    // ВАЖНО: формат CSV согласно заданию:
-    // id, create_date, name, category, price
+    // попробуем оба варианта парсинга
     for i := start; i < len(records); i++ {
         record := records[i]
         if len(record) < 5 {
             continue
         }
 
-        // Парсим поля в правильном порядке:
-        // record[0] - id (не используем, т.к. SERIAL в БД)
-        dateStr := strings.TrimSpace(record[1])  // create_date
-        name := strings.TrimSpace(record[2])     // name
-        category := strings.TrimSpace(record[3]) // category
-        priceStr := strings.TrimSpace(record[4]) // price
+        var name, category, dateStr, priceStr string
+        
+        // Пробуем определить формат по первому полю (id всегда число)
+        if _, err := strconv.Atoi(strings.TrimSpace(record[0])); err == nil {
+            // Первое поле - число, значит это id
+            // Пробуем определить формат по остальным полям
+            
+            // Если второе поле похоже на дату (содержит "-")
+            if strings.Contains(record[1], "-") && len(strings.Split(record[1], "-")) == 3 {
+                // Формат: id, create_date, name, category, price
+                dateStr = strings.TrimSpace(record[1])
+                name = strings.TrimSpace(record[2])
+                category = strings.TrimSpace(record[3])
+                priceStr = strings.TrimSpace(record[4])
+            } else {
+                // Формат: id, name, category, price, create_date
+                name = strings.TrimSpace(record[1])
+                category = strings.TrimSpace(record[2])
+                priceStr = strings.TrimSpace(record[3])
+                dateStr = strings.TrimSpace(record[4])
+            }
+        } else {
+            // Неопределенный формат, пробуем по умолчанию
+            name = strings.TrimSpace(record[0])
+            category = strings.TrimSpace(record[1])
+            priceStr = strings.TrimSpace(record[2])
+            dateStr = strings.TrimSpace(record[3])
+        }
 
         // Пропускаем пустые строки
         if name == "" || category == "" || priceStr == "" || dateStr == "" {
@@ -220,14 +245,20 @@ func processCSV(reader io.Reader, w http.ResponseWriter) {
             continue
         }
 
-        // Парсим дату (формат: ГОД–МЕСЯЦ–ДЕНЬ = YYYY-MM-DD)
-        createDate, err := time.Parse("2006-01-02", dateStr)
+        // Парсим дату
+        var createDate time.Time
+        createDate, err = time.Parse("2006-01-02", dateStr)
         if err != nil {
-            continue
+            // Пробуем другие форматы даты
+            createDate, err = time.Parse("2006/01/02", dateStr)
+            if err != nil {
+                continue
+            }
         }
 
         _, err = stmt.Exec(name, category, price, createDate)
         if err != nil {
+            log.Printf("Insert error: %v", err)
             continue
         }
     
@@ -247,16 +278,17 @@ func processCSV(reader io.Reader, w http.ResponseWriter) {
         stats.TotalItems, stats.TotalCategories, stats.TotalPrice)
 
     w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(stats)
+    if err := json.NewEncoder(w).Encode(stats); err != nil {
+        log.Printf("Failed to encode response: %v", err)
+    }
 }
 
 func handleGet(w http.ResponseWriter, r *http.Request) {
     log.Println("GET /api/v0/prices request received")
 
-    // ВАЖНО: правильный порядок полей согласно заданию:
-    // id, create_date, name, category, price
+    // Выбираем все записи
     rows, err := db.Query(`
-        SELECT id, create_date, name, category, price 
+        SELECT id, name, category, price, create_date 
         FROM prices 
         ORDER BY id
     `)
@@ -266,6 +298,7 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
     }
     defer rows.Close()
 
+    // Создаем временный CSV файл
     csvFile, err := os.CreateTemp("", "data-*.csv")
     if err != nil {
         http.Error(w, "Failed to create CSV file", http.StatusInternalServerError)
@@ -276,45 +309,55 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 
     csvWriter := csv.NewWriter(csvFile)
     
-    // ВАЖНО: заголовок CSV в правильном порядке согласно заданию:
-    csvWriter.Write([]string{"id", "create_date", "name", "category", "price"})
+    // Записываем заголовок
+    if err := csvWriter.Write([]string{"id", "name", "category", "price", "create_date"}); err != nil {
+        http.Error(w, "Failed to write CSV header", http.StatusInternalServerError)
+        return
+    }
     
+    // Читаем данные из БД
     for rows.Next() {
         var id int
-        var createDate time.Time
         var name, category string
         var price float64
+        var createDate time.Time
         
-        if err := rows.Scan(&id, &createDate, &name, &category, &price); err != nil {
+        if err := rows.Scan(&id, &name, &category, &price, &createDate); err != nil {
+            log.Printf("Scan error: %v", err)
             continue
         }
         
-        // Формируем запись в правильном порядке:
+        // Формируем запись
         record := []string{
             strconv.Itoa(id),
-            createDate.Format("2006-01-02"), // ГОД–МЕСЯЦ–ДЕНЬ
             name,
             category,
             strconv.FormatFloat(price, 'f', 2, 64),
+            createDate.Format("2006-01-02"),
         }
         
-        csvWriter.Write(record)
+        if err := csvWriter.Write(record); err != nil {
+            http.Error(w, "Failed to write CSV record", http.StatusInternalServerError)
+            return
+        }
     }
     
     // Проверяем ошибки после цикла
-    if err = rows.Err(); err != nil {
-        http.Error(w, "Database error", http.StatusInternalServerError)
+    if err := rows.Err(); err != nil {
+        http.Error(w, "Database cursor error", http.StatusInternalServerError)
         return
     }
         
     csvWriter.Flush()
     if err := csvWriter.Error(); err != nil {
-        http.Error(w, "Failed to write CSV", http.StatusInternalServerError)
+        http.Error(w, "Failed to flush CSV writer", http.StatusInternalServerError)
         return
     }
 
+    // Перемещаем указатель в начало файла
     csvFile.Seek(0, 0)
 
+    // Создаем временный ZIP файл
     zipFile, err := os.CreateTemp("", "data-*.zip")
     if err != nil {
         http.Error(w, "Failed to create ZIP file", http.StatusInternalServerError)
@@ -331,13 +374,28 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    io.Copy(fileInZip, csvFile)
-    zipWriter.Close()
+    // Копируем CSV в ZIP
+    if _, err := io.Copy(fileInZip, csvFile); err != nil {
+        http.Error(w, "Failed to copy CSV to ZIP", http.StatusInternalServerError)
+        return
+    }
+    
+    // Закрываем ZIP writer
+    if err := zipWriter.Close(); err != nil {
+        http.Error(w, "Failed to close ZIP writer", http.StatusInternalServerError)
+        return
+    }
+
+    // Перемещаем указатель в начало ZIP файла
     zipFile.Seek(0, 0)
 
+    // Отправляем ответ
     w.Header().Set("Content-Type", "application/zip")
     w.Header().Set("Content-Disposition", "attachment; filename=data.zip")
-    io.Copy(w, zipFile)
+    
+    if _, err := io.Copy(w, zipFile); err != nil {
+        log.Printf("Failed to send ZIP file: %v", err)
+    }
     
     log.Println("ZIP archive sent successfully")
 }
