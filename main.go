@@ -5,7 +5,6 @@ import (
     "database/sql"
     "encoding/csv"
     "encoding/json"
-    "fmt"
     "io"
     "log"
     "net/http"
@@ -28,16 +27,7 @@ type Stats struct {
 var db *sql.DB
 
 func main() {
-    // Используем переменные окружения или значения по умолчанию
-    host := getEnv("POSTGRES_HOST", "localhost")
-    port := getEnv("POSTGRES_PORT", "5432")
-    user := getEnv("POSTGRES_USER", "validator")
-    password := getEnv("POSTGRES_PASSWORD", "val1dat0r")
-    dbname := getEnv("POSTGRES_DB", "project-sem-1")
-    
-    connStr := fmt.Sprintf("user=%s password=%s dbname=%s host=%s port=%s sslmode=disable",
-        user, password, dbname, host, port)
-    
+    connStr := "user=validator password=val1dat0r dbname=project-sem-1 host=localhost port=5432 sslmode=disable"
     var err error
     db, err = sql.Open("postgres", connStr)
     if err != nil {
@@ -45,37 +35,22 @@ func main() {
     }
     defer db.Close()
 
-    // Ждем подключения
-    for i := 0; i < 10; i++ {
-        if err := db.Ping(); err == nil {
-            break
-        }
-        time.Sleep(1 * time.Second)
-    }
-    
     if err := db.Ping(); err != nil {
-        log.Fatal("Database connection failed:", err)
+        log.Fatal("Database ping failed:", err)
     }
+    log.Println("Connected to PostgreSQL database")
 
     createTable()
 
     r := mux.NewRouter()
     r.HandleFunc("/api/v0/prices", handlePrices).Methods("POST", "GET")
 
-    serverPort := getEnv("PORT", "8080")
-    log.Printf("Server starting on :%s", serverPort)
-    log.Fatal(http.ListenAndServe(":"+serverPort, r))
-}
-
-func getEnv(key, defaultValue string) string {
-    if value := os.Getenv(key); value != "" {
-        return value
-    }
-    return defaultValue
+    log.Println("Server starting on :8080")
+    log.Fatal(http.ListenAndServe(":8080", r))
 }
 
 func createTable() {
-    // структура таблицы
+    // ИСПРАВЛЕНИЕ 1: Правильная структура таблицы
     query := `
     CREATE TABLE IF NOT EXISTS prices (
         id SERIAL PRIMARY KEY,
@@ -83,31 +58,32 @@ func createTable() {
         category TEXT NOT NULL,
         price DECIMAL(10, 2) NOT NULL,
         create_date TIMESTAMP NOT NULL
-    )`
-    
+         )`
     _, err := db.Exec(query)
     if err != nil {
-        log.Printf("Warning creating table: %v", err)
+        log.Printf("Table creation warning: %v", err)
+    } else {
+        log.Println("Prices table ready")
     }
 }
 
 func handlePrices(w http.ResponseWriter, r *http.Request) {
-    if r.Method == http.MethodPost {
+    switch r.Method {
+    case http.MethodPost:
         handlePost(w, r)
-    } else if r.Method == http.MethodGet {
+    case http.MethodGet:
         handleGet(w, r)
-    } else {
+    default:
         http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
     }
 }
 
 func handlePost(w http.ResponseWriter, r *http.Request) {
-    var reader io.Reader
-    var err error
-    
-    // Поддержка multipart/form-data
+    log.Println("POST /api/v0/prices request received")
+
+    // ИСПРАВЛЕНИЕ 2: Поддержка multipart/form-data
     if strings.Contains(r.Header.Get("Content-Type"), "multipart/form-data") {
-        err = r.ParseMultipartForm(10 << 20)
+        err := r.ParseMultipartForm(10 << 20)
         if err != nil {
             http.Error(w, "Failed to parse form", http.StatusBadRequest)
             return
@@ -119,13 +95,16 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
             return
         }
         defer file.Close()
-        reader = file
-    } else {
-        // Поддержка raw body
-        reader = r.Body
-        defer r.Body.Close()
+        processCSV(file, w)
+        return
     }
     
+    // Оригинальная логика для application/zip
+    processCSV(r.Body, w)
+    defer r.Body.Close()
+}
+
+func processCSV(reader io.Reader, w http.ResponseWriter) {
     body, err := io.ReadAll(reader)
     if err != nil {
         http.Error(w, "Failed to read data", http.StatusBadRequest)
@@ -142,8 +121,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
         http.Error(w, "Invalid ZIP", http.StatusBadRequest)
         return
     }
-
-    // ищем csv
+    
     var csvFile *zip.File
     for _, f := range zipReader.File {
         baseName := filepath.Base(f.Name)
@@ -186,7 +164,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
     }
     defer tx.Rollback()
 
-    // столбцы для вставки
+    // ИСПРАВЛЕНИЕ 3: Правильные столбцы для вставки
     stmt, err := tx.Prepare(`
         INSERT INTO prices (name, category, price, create_date) 
         VALUES ($1, $2, $3, $4)
@@ -196,22 +174,20 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
         return
     }
     defer stmt.Close()
-
-    // Пропускаем заголовок, если есть
+    
     start := 0
     if len(records) > 0 && strings.ToLower(records[0][0]) == "id" {
         start = 1
     }
-
-    inserted := 0
+    
     for i := start; i < len(records); i++ {
         record := records[i]
         if len(record) < 5 {
             continue
         }
 
-        // порядок столбцов id, name, category, price, create_date
-        productID, _ := strconv.Atoi(strings.TrimSpace(record[0]))
+        // ИСПРАВЛЕНИЕ 4: Правильный порядок колонок и парсинг даты
+        // Формат: id, name, category, price, create_date
         name := strings.TrimSpace(record[1])
         category := strings.TrimSpace(record[2])
         priceStr := strings.TrimSpace(record[3])
@@ -219,31 +195,25 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 
         price, err := strconv.ParseFloat(priceStr, 64)
         if err != nil {
-            continue // пропускаем некорректные цены
+            continue
         }
 
-        // парсим дату
+        // ИСПРАВЛЕНИЕ 5: Парсим дату как time.Time
         createDate, err := time.Parse("2006-01-02", dateStr)
         if err != nil {
-            continue // пропускаем некорректные даты
+            continue
         }
 
         _, err = stmt.Exec(name, category, price, createDate)
         if err != nil {
             continue
         }
-
-        inserted++
+    
         stats.TotalItems++
         categorySet[category] = true
         stats.TotalPrice += price
     }
-
-    if inserted == 0 {
-        http.Error(w, "No valid data to insert", http.StatusBadRequest)
-        return
-    }
-
+    
     if err := tx.Commit(); err != nil {
         http.Error(w, "Database error", http.StatusInternalServerError)
         return
@@ -251,12 +221,17 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 
     stats.TotalCategories = len(categorySet)
 
+    log.Printf("Inserted: %d items, %d categories, total price: %.2f", 
+        stats.TotalItems, stats.TotalCategories, stats.TotalPrice)
+
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(stats)
 }
 
 func handleGet(w http.ResponseWriter, r *http.Request) {
-    // столбцы для выборки
+    log.Println("GET /api/v0/prices request received")
+
+    // ИСПРАВЛЕНИЕ 6: Правильные столбцы для выборки
     rows, err := db.Query(`
         SELECT id, name, category, price, create_date 
         FROM prices 
@@ -270,14 +245,15 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 
     csvFile, err := os.CreateTemp("", "data-*.csv")
     if err != nil {
-        http.Error(w, "Failed to create CSV", http.StatusInternalServerError)
+        http.Error(w, "Failed to create CSV file", http.StatusInternalServerError)
         return
     }
     defer os.Remove(csvFile.Name())
     defer csvFile.Close()
 
     csvWriter := csv.NewWriter(csvFile)
-    // заголовки столбцов в csv
+    
+    // ИСПРАВЛЕНИЕ 7: Правильный заголовок CSV
     csvWriter.Write([]string{"id", "name", "category", "price", "create_date"})
     
     for rows.Next() {
@@ -290,7 +266,7 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
             continue
         }
         
-        // формат даты
+        // ИСПРАВЛЕНИЕ 8: Правильный формат даты
         record := []string{
             strconv.Itoa(id),
             name,
@@ -301,12 +277,7 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
         
         csvWriter.Write(record)
     }
-    
-    if err := rows.Err(); err != nil {
-        http.Error(w, "Database error", http.StatusInternalServerError)
-        return
-    }
-    
+        
     csvWriter.Flush()
     if err := csvWriter.Error(); err != nil {
         http.Error(w, "Failed to write CSV", http.StatusInternalServerError)
@@ -317,13 +288,14 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 
     zipFile, err := os.CreateTemp("", "data-*.zip")
     if err != nil {
-        http.Error(w, "Failed to create ZIP", http.StatusInternalServerError)
+        http.Error(w, "Failed to create ZIP file", http.StatusInternalServerError)
         return
     }
     defer os.Remove(zipFile.Name())
     defer zipFile.Close()
 
     zipWriter := zip.NewWriter(zipFile)
+    
     fileInZip, err := zipWriter.Create("data.csv")
     if err != nil {
         http.Error(w, "Failed to create file in ZIP", http.StatusInternalServerError)
@@ -337,4 +309,6 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
     w.Header().Set("Content-Type", "application/zip")
     w.Header().Set("Content-Disposition", "attachment; filename=data.zip")
     io.Copy(w, zipFile)
+    
+    log.Println("ZIP archive sent successfully")
 }
