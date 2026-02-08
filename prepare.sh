@@ -1,28 +1,20 @@
 #!/bin/bash
-# prepare
+# Prepare environment
 
-go mod tidy
-go get github.com/lib/pq
+# Install Go dependencies
+go mod download
 
-# start postgres if not running
-if ! docker ps | grep -q project-sem1-db; then
-    docker stop project-sem1-db 2>/dev/null
-    docker rm project-sem1-db 2>/dev/null
-    
-    # испр. пароль
-    docker run -d \
-        --name project-sem1-db \
-        -p 5432:5432 \
-        -e POSTGRES_USER=validator \
-        -e POSTGRES_PASSWORD=val1dat0r \
-        -e POSTGRES_DB=project-sem-1 \
-        postgres:15
-    
-    sleep 3
-fi
+# ожидание
+echo "Waiting for PostgreSQL..."
+for i in {1..30}; do
+  if pg_isready -h localhost -p 5432 -U validator 2>/dev/null; then
+    echo "PostgreSQL is ready"
+    break
+  fi
+  sleep 1
+done
 
-# create table with create_date
-docker exec project-sem1-db psql -U validator -d project-sem-1 -c "
+PGPASSWORD=val1dat0r psql -h localhost -U validator -d project-sem-1 -c "
 CREATE TABLE IF NOT EXISTS prices (
     id SERIAL PRIMARY KEY,
     product_id INTEGER,
@@ -30,4 +22,4 @@ CREATE TABLE IF NOT EXISTS prices (
     category TEXT,
     price DECIMAL(10, 2),
     create_date DATE
-    );" 2>/dev/null || true
+);" 2>/dev/null || true

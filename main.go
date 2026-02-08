@@ -28,43 +28,73 @@ type Stats struct {
 var db *sql.DB
 
 func main() {
-    host := os.Getenv("POSTGRES_HOST")
-    if host == "" {
-        host = "localhost"
-    }
+    log.Println("Starting server...")
     
-    // исправила пароль
-    connStr := fmt.Sprintf("user=validator password=val1dat0r dbname=project-sem-1 host=%s port=5432 sslmode=disable", host)
+    // Получаем конфигурацию из переменных окружения
+    host := getEnv("POSTGRES_HOST", "localhost")
+    port := getEnv("POSTGRES_PORT", "5432")
+    user := getEnv("POSTGRES_USER", "validator")
+    password := getEnv("POSTGRES_PASSWORD", "val1dat0r")
+    dbname := getEnv("POSTGRES_DB", "project-sem-1")
+    
+    connStr := fmt.Sprintf("user=%s password=%s dbname=%s host=%s port=%s sslmode=disable",
+        user, password, dbname, host, port)
+    
     var err error
     db, err = sql.Open("postgres", connStr)
     if err != nil {
-        log.Fatal(err)
+        log.Fatal("Failed to connect to database:", err)
     }
     defer db.Close()
 
-    for i := 0; i < 10; i++ {
+    // Ждем подключения к БД
+    for i := 0; i < 30; i++ {
         if err := db.Ping(); err == nil {
+            log.Println("Connected to PostgreSQL")
             break
         }
-        time.Sleep(2 * time.Second)
+        log.Printf("Waiting for database... (%d/30)", i+1)
+        time.Sleep(1 * time.Second)
     }
     
     if err := db.Ping(); err != nil {
-        log.Fatal(err)
+        log.Fatal("Database connection failed:", err)
     }
 
     createTable()
 
     r := mux.NewRouter()
+    
+    // Health check endpoint
+    r.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+        if err := db.Ping(); err != nil {
+            http.Error(w, "Database not connected", http.StatusServiceUnavailable)
+            return
+        }
+        w.WriteHeader(http.StatusOK)
+        w.Write([]byte("OK"))
+    }).Methods("GET")
+    
     r.HandleFunc("/api/v0/prices", handlePrices).Methods("POST", "GET")
 
-    port := os.Getenv("PORT")
-    if port == "" {
-        port = "8080"
+    serverPort := getEnv("PORT", "8080")
+    log.Printf("Server starting on :%s", serverPort)
+    
+    server := &http.Server{
+        Addr:         ":" + serverPort,
+        Handler:      r,
+        ReadTimeout:  10 * time.Second,
+        WriteTimeout: 10 * time.Second,
     }
     
-    log.Printf("Server starting on :%s", port)
-    log.Fatal(http.ListenAndServe(":"+port, r))
+    log.Fatal(server.ListenAndServe())
+}
+
+func getEnv(key, defaultValue string) string {
+    if value := os.Getenv(key); value != "" {
+        return value
+    }
+    return defaultValue
 }
 
 func createTable() {
@@ -79,7 +109,7 @@ func createTable() {
     )`
     _, err := db.Exec(query)
     if err != nil {
-        log.Printf("warning: %v", err)
+        log.Printf("Warning creating table: %v", err)
     }
 }
 
@@ -89,53 +119,53 @@ func handlePrices(w http.ResponseWriter, r *http.Request) {
     } else if r.Method == http.MethodGet {
         handleGet(w, r)
     } else {
-        http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
     }
 }
 
 func handlePost(w http.ResponseWriter, r *http.Request) {
-    // Поддерживаем оба формата: multipart/form-data и application/zip
-    var body []byte
-    var err error
-    
+    // Поддерживаем multipart/form-data
     if strings.Contains(r.Header.Get("Content-Type"), "multipart/form-data") {
-        // Обрабатываем multipart/form-data
-        err = r.ParseMultipartForm(10 << 20) // 10MB
+        err := r.ParseMultipartForm(10 << 20) // 10MB
         if err != nil {
-            http.Error(w, "failed to parse form", http.StatusBadRequest)
+            http.Error(w, "Failed to parse form", http.StatusBadRequest)
             return
         }
         
         file, _, err := r.FormFile("file")
         if err != nil {
-            http.Error(w, "file not found in form", http.StatusBadRequest)
+            http.Error(w, "File not found", http.StatusBadRequest)
             return
         }
         defer file.Close()
         
-        body, err = io.ReadAll(file)
-    } else {
-        // Обрабатываем application/zip
-        body, err = io.ReadAll(r.Body)
-        defer r.Body.Close()
+        processCSV(file, w)
+        return
     }
     
+    // Поддерживаем raw body
+    processCSV(r.Body, w)
+    defer r.Body.Close()
+}
+
+func processCSV(reader io.Reader, w http.ResponseWriter) {
+    body, err := io.ReadAll(reader)
     if err != nil {
-        http.Error(w, "failed to read request", http.StatusBadRequest)
+        http.Error(w, "Failed to read data", http.StatusBadRequest)
         return
     }
-    
+
     if len(body) == 0 {
-        http.Error(w, "empty request", http.StatusBadRequest)
+        http.Error(w, "Empty data", http.StatusBadRequest)
         return
     }
-    
+
     zipReader, err := zip.NewReader(strings.NewReader(string(body)), int64(len(body)))
     if err != nil {
-        http.Error(w, "invalid zip", http.StatusBadRequest)
+        http.Error(w, "Invalid ZIP", http.StatusBadRequest)
         return
     }
-    
+
     var csvFile *zip.File
     for _, f := range zipReader.File {
         if filepath.Base(f.Name) == "data.csv" || filepath.Base(f.Name) == "test_data.csv" {
@@ -144,26 +174,26 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
         }
     }
     if csvFile == nil {
-        http.Error(w, "csv file not found", http.StatusBadRequest)
+        http.Error(w, "CSV file not found", http.StatusBadRequest)
         return
     }
-    
+
     rc, err := csvFile.Open()
     if err != nil {
-        http.Error(w, "failed to open csv", http.StatusInternalServerError)
+        http.Error(w, "Failed to open CSV", http.StatusInternalServerError)
         return
     }
     defer rc.Close()
-    
+
     csvReader := csv.NewReader(rc)
     records, err := csvReader.ReadAll()
     if err != nil {
-        http.Error(w, "failed to read csv", http.StatusInternalServerError)
+        http.Error(w, "Failed to read CSV", http.StatusInternalServerError)
         return
     }
 
     if len(records) == 0 {
-        http.Error(w, "empty csv", http.StatusBadRequest)
+        http.Error(w, "Empty CSV", http.StatusBadRequest)
         return
     }
 
@@ -172,7 +202,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 
     tx, err := db.Begin()
     if err != nil {
-        http.Error(w, "database error", http.StatusInternalServerError)
+        http.Error(w, "Database error", http.StatusInternalServerError)
         return
     }
     defer tx.Rollback()
@@ -182,14 +212,14 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
         VALUES ($1, $2, $3, $4, $5)
     `)
     if err != nil {
-        http.Error(w, "database error", http.StatusInternalServerError)
+        http.Error(w, "Database error", http.StatusInternalServerError)
         return
     }
     defer stmt.Close()
-    
+
     start := 0
     if len(records) > 0 && strings.ToLower(records[0][0]) == "id" {
-        start = 1 // пропускаем заголовок
+        start = 1
     }
 
     for i := start; i < len(records); i++ {
@@ -197,17 +227,16 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
         if len(record) < 5 {
             continue
         }
-
-        // id,name,category,price,create_date
+        
         productID, _ := strconv.Atoi(strings.TrimSpace(record[0]))
         name := strings.TrimSpace(record[1])
         category := strings.TrimSpace(record[2])
         priceStr := strings.TrimSpace(record[3])
-        createDate := strings.TrimSpace(record[4]) 
+        createDate := strings.TrimSpace(record[4])
 
         price, err := strconv.ParseFloat(priceStr, 64)
         if err != nil {
-            continue // пропускаем некорректные цены
+            continue
         }
 
         _, err = stmt.Exec(productID, name, category, price, createDate)
@@ -221,7 +250,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
     }
 
     if err := tx.Commit(); err != nil {
-        http.Error(w, "database error", http.StatusInternalServerError)
+        http.Error(w, "Database error", http.StatusInternalServerError)
         return
     }
 
@@ -238,22 +267,20 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
         ORDER BY id
     `)
     if err != nil {
-        http.Error(w, "database error", http.StatusInternalServerError)
+        http.Error(w, "Database error", http.StatusInternalServerError)
         return
     }
     defer rows.Close()
-    
+
     csvFile, err := os.CreateTemp("", "data-*.csv")
     if err != nil {
-        http.Error(w, "failed to create csv", http.StatusInternalServerError)
+        http.Error(w, "Failed to create CSV", http.StatusInternalServerError)
         return
     }
     defer os.Remove(csvFile.Name())
     defer csvFile.Close()
-
-    csvWriter := csv.NewWriter(csvFile)
     
-    // ЗАГОЛОВОК: id,name,category,price,create_date
+    csvWriter := csv.NewWriter(csvFile)
     csvWriter.Write([]string{"id", "name", "category", "price", "create_date"})
     
     for rows.Next() {
@@ -279,25 +306,24 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
     
     csvWriter.Flush()
     if err := csvWriter.Error(); err != nil {
-        http.Error(w, "failed to write csv", http.StatusInternalServerError)
+        http.Error(w, "Failed to write CSV", http.StatusInternalServerError)
         return
     }
 
     csvFile.Seek(0, 0)
-    
+
     zipFile, err := os.CreateTemp("", "data-*.zip")
     if err != nil {
-        http.Error(w, "failed to create zip", http.StatusInternalServerError)
+        http.Error(w, "Failed to create ZIP", http.StatusInternalServerError)
         return
     }
     defer os.Remove(zipFile.Name())
     defer zipFile.Close()
-
-    zipWriter := zip.NewWriter(zipFile)
     
+    zipWriter := zip.NewWriter(zipFile)
     fileInZip, err := zipWriter.Create("data.csv")
     if err != nil {
-        http.Error(w, "failed to create file in zip", http.StatusInternalServerError)
+        http.Error(w, "Failed to create file in ZIP", http.StatusInternalServerError)
         return
     }
 
