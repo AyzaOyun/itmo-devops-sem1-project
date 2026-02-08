@@ -5,6 +5,7 @@ import (
     "database/sql"
     "encoding/csv"
     "encoding/json"
+    "fmt"
     "io"
     "log"
     "net/http"
@@ -12,6 +13,7 @@ import (
     "path/filepath"
     "strconv"
     "strings"
+    "time"
 
     "github.com/gorilla/mux"
     _ "github.com/lib/pq"
@@ -26,7 +28,13 @@ type Stats struct {
 var db *sql.DB
 
 func main() {
-    connStr := "user=validator password=validator dbname=project-sem-1 host=localhost port=5432 sslmode=disable"
+    host := os.Getenv("POSTGRES_HOST")
+    if host == "" {
+        host = "localhost"
+    }
+    
+    // исправила пароль
+    connStr := fmt.Sprintf("user=validator password=val1dat0r dbname=project-sem-1 host=%s port=5432 sslmode=disable", host)
     var err error
     db, err = sql.Open("postgres", connStr)
     if err != nil {
@@ -34,6 +42,13 @@ func main() {
     }
     defer db.Close()
 
+    for i := 0; i < 10; i++ {
+        if err := db.Ping(); err == nil {
+            break
+        }
+        time.Sleep(2 * time.Second)
+    }
+    
     if err := db.Ping(); err != nil {
         log.Fatal(err)
     }
@@ -43,8 +58,13 @@ func main() {
     r := mux.NewRouter()
     r.HandleFunc("/api/v0/prices", handlePrices).Methods("POST", "GET")
 
-    log.Println("Server starting on :8080")
-    log.Fatal(http.ListenAndServe(":8080", r))
+    port := os.Getenv("PORT")
+    if port == "" {
+        port = "8080"
+    }
+    
+    log.Printf("Server starting on :%s", port)
+    log.Fatal(http.ListenAndServe(":"+port, r))
 }
 
 func createTable() {
@@ -74,50 +94,67 @@ func handlePrices(w http.ResponseWriter, r *http.Request) {
 }
 
 func handlePost(w http.ResponseWriter, r *http.Request) {
-    log.Println("POST request")
-
-    // read body
-    body, err := io.ReadAll(r.Body)
+    // Поддерживаем оба формата: multipart/form-data и application/zip
+    var body []byte
+    var err error
+    
+    if strings.Contains(r.Header.Get("Content-Type"), "multipart/form-data") {
+        // Обрабатываем multipart/form-data
+        err = r.ParseMultipartForm(10 << 20) // 10MB
+        if err != nil {
+            http.Error(w, "failed to parse form", http.StatusBadRequest)
+            return
+        }
+        
+        file, _, err := r.FormFile("file")
+        if err != nil {
+            http.Error(w, "file not found in form", http.StatusBadRequest)
+            return
+        }
+        defer file.Close()
+        
+        body, err = io.ReadAll(file)
+    } else {
+        // Обрабатываем application/zip
+        body, err = io.ReadAll(r.Body)
+        defer r.Body.Close()
+    }
+    
     if err != nil {
-        http.Error(w, "failed to read body", http.StatusBadRequest)
+        http.Error(w, "failed to read request", http.StatusBadRequest)
         return
     }
-    defer r.Body.Close()
-
+    
     if len(body) == 0 {
-        http.Error(w, "empty body", http.StatusBadRequest)
+        http.Error(w, "empty request", http.StatusBadRequest)
         return
     }
-
-    // open zip
+    
     zipReader, err := zip.NewReader(strings.NewReader(string(body)), int64(len(body)))
     if err != nil {
         http.Error(w, "invalid zip", http.StatusBadRequest)
         return
     }
-
-    // find csv
+    
     var csvFile *zip.File
-    for _, file := range zipReader.File {
-        if filepath.Base(file.Name) == "data.csv" {
-            csvFile = file
+    for _, f := range zipReader.File {
+        if filepath.Base(f.Name) == "data.csv" || filepath.Base(f.Name) == "test_data.csv" {
+            csvFile = f
             break
         }
     }
     if csvFile == nil {
-        http.Error(w, "data.csv not found", http.StatusBadRequest)
+        http.Error(w, "csv file not found", http.StatusBadRequest)
         return
     }
-
-    // open csv
+    
     rc, err := csvFile.Open()
     if err != nil {
         http.Error(w, "failed to open csv", http.StatusInternalServerError)
         return
     }
     defer rc.Close()
-
-    // read csv
+    
     csvReader := csv.NewReader(rc)
     records, err := csvReader.ReadAll()
     if err != nil {
@@ -149,11 +186,10 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
         return
     }
     defer stmt.Close()
-
-    // skip header if exists
+    
     start := 0
-    if len(records) > 0 && records[0][0] == "id" {
-        start = 1
+    if len(records) > 0 && strings.ToLower(records[0][0]) == "id" {
+        start = 1 // пропускаем заголовок
     }
 
     for i := start; i < len(records); i++ {
@@ -162,15 +198,16 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
             continue
         }
 
+        // id,name,category,price,create_date
         productID, _ := strconv.Atoi(strings.TrimSpace(record[0]))
         name := strings.TrimSpace(record[1])
         category := strings.TrimSpace(record[2])
         priceStr := strings.TrimSpace(record[3])
-        createDate := strings.TrimSpace(record[4])
+        createDate := strings.TrimSpace(record[4]) 
 
         price, err := strconv.ParseFloat(priceStr, 64)
         if err != nil {
-            continue
+            continue // пропускаем некорректные цены
         }
 
         _, err = stmt.Exec(productID, name, category, price, createDate)
@@ -195,8 +232,6 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleGet(w http.ResponseWriter, r *http.Request) {
-    log.Println("GET request")
-
     rows, err := db.Query(`
         SELECT product_id, name, category, price, create_date 
         FROM prices 
@@ -207,8 +242,7 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
         return
     }
     defer rows.Close()
-
-    // create temp csv
+    
     csvFile, err := os.CreateTemp("", "data-*.csv")
     if err != nil {
         http.Error(w, "failed to create csv", http.StatusInternalServerError)
@@ -219,6 +253,7 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 
     csvWriter := csv.NewWriter(csvFile)
     
+    // ЗАГОЛОВОК: id,name,category,price,create_date
     csvWriter.Write([]string{"id", "name", "category", "price", "create_date"})
     
     for rows.Next() {
@@ -249,8 +284,7 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
     }
 
     csvFile.Seek(0, 0)
-
-    // create zip
+    
     zipFile, err := os.CreateTemp("", "data-*.zip")
     if err != nil {
         http.Error(w, "failed to create zip", http.StatusInternalServerError)
