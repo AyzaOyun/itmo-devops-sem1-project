@@ -35,8 +35,18 @@ func main() {
     }
     defer db.Close()
 
+    // Ждем подключения к БД
+    for i := 0; i < 10; i++ {
+        if err := db.Ping(); err != nil {
+            log.Printf("Attempt %d: Database ping failed, retrying...", i+1)
+            time.Sleep(2 * time.Second)
+        } else {
+            break
+        }
+    }
+    
     if err := db.Ping(); err != nil {
-        log.Fatal("Database ping failed:", err)
+        log.Fatal("Database ping failed after retries:", err)
     }
     log.Println("Connected to PostgreSQL database")
 
@@ -50,7 +60,6 @@ func main() {
 }
 
 func createTable() {
-    // ИСПРАВЛЕНИЕ 1: Правильная структура таблицы
     query := `
     CREATE TABLE IF NOT EXISTS prices (
         id SERIAL PRIMARY KEY,
@@ -58,7 +67,7 @@ func createTable() {
         category TEXT NOT NULL,
         price DECIMAL(10, 2) NOT NULL,
         create_date TIMESTAMP NOT NULL
-         )`
+    )`
     _, err := db.Exec(query)
     if err != nil {
         log.Printf("Table creation warning: %v", err)
@@ -81,7 +90,7 @@ func handlePrices(w http.ResponseWriter, r *http.Request) {
 func handlePost(w http.ResponseWriter, r *http.Request) {
     log.Println("POST /api/v0/prices request received")
 
-    // ИСПРАВЛЕНИЕ 2: Поддержка multipart/form-data
+    // Поддержка multipart/form-data
     if strings.Contains(r.Header.Get("Content-Type"), "multipart/form-data") {
         err := r.ParseMultipartForm(10 << 20)
         if err != nil {
@@ -101,7 +110,6 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
     
     // Оригинальная логика для application/zip
     processCSV(r.Body, w)
-    defer r.Body.Close()
 }
 
 func processCSV(reader io.Reader, w http.ResponseWriter) {
@@ -164,7 +172,6 @@ func processCSV(reader io.Reader, w http.ResponseWriter) {
     }
     defer tx.Rollback()
 
-    // ИСПРАВЛЕНИЕ 3: Правильные столбцы для вставки
     stmt, err := tx.Prepare(`
         INSERT INTO prices (name, category, price, create_date) 
         VALUES ($1, $2, $3, $4)
@@ -175,30 +182,45 @@ func processCSV(reader io.Reader, w http.ResponseWriter) {
     }
     defer stmt.Close()
     
+    // Пропускаем заголовок если он есть
     start := 0
-    if len(records) > 0 && strings.ToLower(records[0][0]) == "id" {
-        start = 1
+    if len(records) > 0 {
+        firstRecord := strings.ToLower(strings.Join(records[0], ","))
+        if strings.Contains(firstRecord, "id") && 
+           strings.Contains(firstRecord, "create_date") && 
+           strings.Contains(firstRecord, "name") && 
+           strings.Contains(firstRecord, "category") && 
+           strings.Contains(firstRecord, "price") {
+            start = 1
+        }
     }
     
+    // ВАЖНО: формат CSV согласно заданию:
+    // id, create_date, name, category, price
     for i := start; i < len(records); i++ {
         record := records[i]
         if len(record) < 5 {
             continue
         }
 
-        // ИСПРАВЛЕНИЕ 4: Правильный порядок колонок и парсинг даты
-        // Формат: id, name, category, price, create_date
-        name := strings.TrimSpace(record[1])
-        category := strings.TrimSpace(record[2])
-        priceStr := strings.TrimSpace(record[3])
-        dateStr := strings.TrimSpace(record[4])
+        // Парсим поля в правильном порядке:
+        // record[0] - id (не используем, т.к. SERIAL в БД)
+        dateStr := strings.TrimSpace(record[1])  // create_date
+        name := strings.TrimSpace(record[2])     // name
+        category := strings.TrimSpace(record[3]) // category
+        priceStr := strings.TrimSpace(record[4]) // price
+
+        // Пропускаем пустые строки
+        if name == "" || category == "" || priceStr == "" || dateStr == "" {
+            continue
+        }
 
         price, err := strconv.ParseFloat(priceStr, 64)
         if err != nil {
             continue
         }
 
-        // ИСПРАВЛЕНИЕ 5: Парсим дату как time.Time
+        // Парсим дату (формат: ГОД–МЕСЯЦ–ДЕНЬ = YYYY-MM-DD)
         createDate, err := time.Parse("2006-01-02", dateStr)
         if err != nil {
             continue
@@ -231,9 +253,10 @@ func processCSV(reader io.Reader, w http.ResponseWriter) {
 func handleGet(w http.ResponseWriter, r *http.Request) {
     log.Println("GET /api/v0/prices request received")
 
-    // ИСПРАВЛЕНИЕ 6: Правильные столбцы для выборки
+    // ВАЖНО: правильный порядок полей согласно заданию:
+    // id, create_date, name, category, price
     rows, err := db.Query(`
-        SELECT id, name, category, price, create_date 
+        SELECT id, create_date, name, category, price 
         FROM prices 
         ORDER BY id
     `)
@@ -253,29 +276,35 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 
     csvWriter := csv.NewWriter(csvFile)
     
-    // ИСПРАВЛЕНИЕ 7: Правильный заголовок CSV
-    csvWriter.Write([]string{"id", "name", "category", "price", "create_date"})
+    // ВАЖНО: заголовок CSV в правильном порядке согласно заданию:
+    csvWriter.Write([]string{"id", "create_date", "name", "category", "price"})
     
     for rows.Next() {
         var id int
+        var createDate time.Time
         var name, category string
         var price float64
-        var createDate time.Time
         
-        if err := rows.Scan(&id, &name, &category, &price, &createDate); err != nil {
+        if err := rows.Scan(&id, &createDate, &name, &category, &price); err != nil {
             continue
         }
         
-        // ИСПРАВЛЕНИЕ 8: Правильный формат даты
+        // Формируем запись в правильном порядке:
         record := []string{
             strconv.Itoa(id),
+            createDate.Format("2006-01-02"), // ГОД–МЕСЯЦ–ДЕНЬ
             name,
             category,
             strconv.FormatFloat(price, 'f', 2, 64),
-            createDate.Format("2006-01-02"),
         }
         
         csvWriter.Write(record)
+    }
+    
+    // Проверяем ошибки после цикла
+    if err = rows.Err(); err != nil {
+        http.Error(w, "Database error", http.StatusInternalServerError)
+        return
     }
         
     csvWriter.Flush()
