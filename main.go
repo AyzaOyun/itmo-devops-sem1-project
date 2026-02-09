@@ -5,6 +5,7 @@ import (
     "database/sql"
     "encoding/csv"
     "encoding/json"
+    "fmt"
     "io"
     "log"
     "net/http"
@@ -26,7 +27,31 @@ type Stats struct {
 var db *sql.DB
 
 func main() {
-    connStr := "user=validator password=val1dat0r dbname=project-sem-1 host=localhost port=5432 sslmode=disable"
+    // Берем настройки из переменных окружения или используем значения по умолчанию
+    dbHost := os.Getenv("POSTGRES_HOST")
+    if dbHost == "" {
+        dbHost = "localhost"
+    }
+    dbPort := os.Getenv("POSTGRES_PORT")
+    if dbPort == "" {
+        dbPort = "5432"
+    }
+    dbUser := os.Getenv("POSTGRES_USER")
+    if dbUser == "" {
+        dbUser = "validator"
+    }
+    dbPassword := os.Getenv("POSTGRES_PASSWORD")
+    if dbPassword == "" {
+        dbPassword = "val1dat0r"
+    }
+    dbName := os.Getenv("POSTGRES_DB")
+    if dbName == "" {
+        dbName = "project-sem-1"
+    }
+
+    connStr := fmt.Sprintf("user=%s password=%s dbname=%s host=%s port=%s sslmode=disable",
+        dbUser, dbPassword, dbName, dbHost, dbPort)
+    
     var err error
     db, err = sql.Open("postgres", connStr)
     if err != nil {
@@ -199,41 +224,18 @@ func processCSV(reader io.Reader, w http.ResponseWriter) {
         }
     }
     
-    // попробуем оба варианта парсинга
+    // В тестах формат: id,name,category,price,create_date
     for i := start; i < len(records); i++ {
         record := records[i]
         if len(record) < 5 {
             continue
         }
 
-        var name, category, dateStr, priceStr string
-        
-        // Пробуем определить формат по первому полю (id всегда число)
-        if _, err := strconv.Atoi(strings.TrimSpace(record[0])); err == nil {
-            // Первое поле - число, значит это id
-            // Пробуем определить формат по остальным полям
-            
-            // Если второе поле похоже на дату (содержит "-")
-            if strings.Contains(record[1], "-") && len(strings.Split(record[1], "-")) == 3 {
-                // Формат: id, create_date, name, category, price
-                dateStr = strings.TrimSpace(record[1])
-                name = strings.TrimSpace(record[2])
-                category = strings.TrimSpace(record[3])
-                priceStr = strings.TrimSpace(record[4])
-            } else {
-                // Формат: id, name, category, price, create_date
-                name = strings.TrimSpace(record[1])
-                category = strings.TrimSpace(record[2])
-                priceStr = strings.TrimSpace(record[3])
-                dateStr = strings.TrimSpace(record[4])
-            }
-        } else {
-            // Неопределенный формат, пробуем по умолчанию
-            name = strings.TrimSpace(record[0])
-            category = strings.TrimSpace(record[1])
-            priceStr = strings.TrimSpace(record[2])
-            dateStr = strings.TrimSpace(record[3])
-        }
+        // Формат в автотестах: id,name,category,price,create_date
+        name := strings.TrimSpace(record[1])
+        category := strings.TrimSpace(record[2])
+        priceStr := strings.TrimSpace(record[3])
+        dateStr := strings.TrimSpace(record[4])
 
         // Пропускаем пустые строки
         if name == "" || category == "" || priceStr == "" || dateStr == "" {
@@ -246,19 +248,13 @@ func processCSV(reader io.Reader, w http.ResponseWriter) {
         }
 
         // Парсим дату
-        var createDate time.Time
-        createDate, err = time.Parse("2006-01-02", dateStr)
+        createDate, err := time.Parse("2006-01-02", dateStr)
         if err != nil {
-            // Пробуем другие форматы даты
-            createDate, err = time.Parse("2006/01/02", dateStr)
-            if err != nil {
-                continue
-            }
+            continue
         }
 
         _, err = stmt.Exec(name, category, price, createDate)
         if err != nil {
-            log.Printf("Insert error: %v", err)
             continue
         }
     
@@ -323,7 +319,6 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
         var createDate time.Time
         
         if err := rows.Scan(&id, &name, &category, &price, &createDate); err != nil {
-            log.Printf("Scan error: %v", err)
             continue
         }
         

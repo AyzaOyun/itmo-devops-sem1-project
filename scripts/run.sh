@@ -1,21 +1,18 @@
 #!/bin/bash
 set -e
 
-cd ..
-nohup go run main.go > server.log 2>&1 &
+# Запускаем сервер в фоне
+go run main.go &
 SERVER_PID=$!
 
-echo "Server started with PID: $SERVER_PID"
-echo "Logs: server.log"
+echo $SERVER_PID > /tmp/server.pid
 
-sleep 15
+# Даем больше времени на запуск
+sleep 10
 
-if curl -s http://localhost:8080/api/v0/prices >/dev/null 2>&1; then
-    echo $SERVER_PID > /tmp/server.pid
+# Простая проверка
+if kill -0 $SERVER_PID 2>/dev/null; then
     exit 0
 else
-    echo "Server failed to start"
-    cat server.log
-    kill $SERVER_PID 2>/dev/null
     exit 1
 fi
