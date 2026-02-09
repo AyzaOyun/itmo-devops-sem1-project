@@ -1,0 +1,4 @@
+id,name,category,price,create_date
+1,item1,cat1,100,2024-01-01
+2,item2,cat2,200,2024-01-15
+3,item3,cat3,300,2024-01-20
